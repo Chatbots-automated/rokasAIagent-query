@@ -1,5 +1,6 @@
 const { createClient } = require('@supabase/supabase-js');
 const Fuse = require('fuse.js');
+const { performance } = require('perf_hooks');
 
 // ─── Supabase connection ────────────────────────────────────────────────
 const supabase = createClient(
@@ -8,74 +9,73 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-// ─── In-memory cache & helpers ──────────────────────────────────────────
+// ─── In-memory cache ────────────────────────────────────────────────────
 let cache = null;
 let fuse  = null;
 let last  = 0;
-const TTL = 5 * 60 * 1000;    // 5-minute cache
+const TTL = 5 * 60 * 1000; // 5 min
 
 async function load() {
   if (cache && Date.now() - last < TTL) {
-    console.log('[load] using cached data – rows:', cache.length);
+    console.log('[load] using cached data – rows:', cache.length,
+                'age(ms):', Date.now() - last);
     return;
   }
   console.log('[load] refreshing cache from Supabase …');
   const { data, error } = await supabase.from('products').select('*');
-  if (error) {
-    console.error('[load] Supabase error:', error.message);
-    throw new Error(error.message);
-  }
+  if (error) throw new Error('Supabase: ' + error.message);
+
   cache = data;
-  fuse  = new Fuse(cache, {
+  fuse = new Fuse(cache, {
     keys: ['product_name', 'product_code', 'barcode'],
-    threshold: 0.3,            // tweak for looser/stricter fuzzy match
-    includeScore: true         // <-- needed for debug
+    threshold: 0.3,
+    includeScore: true
   });
   last = Date.now();
-  console.log('[load] cache built – rows:', cache.length);
+  console.log('[load] cache rebuilt – rows:', cache.length,
+              'mem ~', (JSON.stringify(cache).length / 1024 / 1024).toFixed(1), 'MB');
 }
 
-// ─── Serverless handler ────────────────────────────────────────────────
+// ─── Handler ────────────────────────────────────────────────────────────
 module.exports = async (req, res) => {
+  const t0 = performance.now();
   try {
+    console.log('──────────────────────────────────────────────');
+    console.log('[req] raw body:', JSON.stringify(req.body));
+
     const { term = '' } = req.body || {};
     const q = term.toString().trim();
-    console.log('──────────────────────────────────────────────');
-    console.log('[handler] incoming term:', `"${q}"`);
+    console.log('[handler] incoming term:', `"${q}"`, 'len:', q.length);
 
-    if (!q) {
-      console.warn('[handler] term missing');
-      return res.status(400).json({ error: 'term missing' });
-    }
+    if (!q) return res.status(400).json({ error: 'term missing' });
 
     await load();
 
-    // 1) exact product_code match
-    const exact = cache.filter(
-      r => r.product_code && r.product_code.toLowerCase() === q.toLowerCase()
+    // exact match
+    const exact = cache.filter(r =>
+      r.product_code && r.product_code.toLowerCase() === q.toLowerCase()
     );
+    console.log('[exact] count:', exact.length,
+      'sample:', exact.slice(0, 3).map(r => r.product_code));
 
-    // 2) fuzzy fallback (full result list with scores for debug)
+    // fuzzy
     const fuzzyRaw = fuse.search(q);
-    console.log('[handler] fuse raw size:', fuzzyRaw.length,
+    console.log('[fuse] total:', fuzzyRaw.length,
       'top-5:', fuzzyRaw.slice(0, 5).map(r => ({
         score: r.score.toFixed(3),
-        name: r.item.product_name
+        code:  r.item.product_code,
+        name:  r.item.product_name.slice(0, 40)
       }))
     );
 
-    const hits = exact.length
-      ? exact
-      : fuzzyRaw.map(r => r.item).slice(0, 10);
+    const hits = exact.length ? exact : fuzzyRaw.map(r => r.item).slice(0, 10);
+    console.log('[hits] returned:', hits.length,
+      'sample:', hits.slice(0, 3).map(r => r.product_code));
 
-    console.log(
-      `[handler] exact matches: ${exact.length}, final hits returned: ${hits.length}`
-    );
-    if (hits.length === 0) console.log('[handler] NO RESULTS');
-
+    console.log('[done] elapsed ms:', (performance.now() - t0).toFixed(1));
     return res.json(hits);
   } catch (err) {
-    console.error('[handler] fatal error:', err);
+    console.error('[fatal]', err);
     return res.status(500).json({ error: err.message });
   }
 };
