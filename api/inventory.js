@@ -12,41 +12,36 @@ const supabase = createClient(
 let cache = null;
 let fuse  = null;
 let last  = 0;
-const TTL = 5 * 60 * 1000; // 5 min
+const TTL = 5 * 60 * 1000;    // 5-minute cache
 
 async function load() {
-  // Re-use cache if still fresh
   if (cache && Date.now() - last < TTL) {
     console.log('[load] using cached data – rows:', cache.length);
     return;
   }
-
   console.log('[load] refreshing cache from Supabase …');
   const { data, error } = await supabase.from('products').select('*');
-
   if (error) {
     console.error('[load] Supabase error:', error.message);
     throw new Error(error.message);
   }
-
   cache = data;
   fuse  = new Fuse(cache, {
     keys: ['product_name', 'product_code', 'barcode'],
-    threshold: 0.3,
+    threshold: 0.3,            // tweak for looser/stricter fuzzy match
+    includeScore: true         // <-- needed for debug
   });
-  last  = Date.now();
-
+  last = Date.now();
   console.log('[load] cache built – rows:', cache.length);
 }
 
 // ─── Serverless handler ────────────────────────────────────────────────
 module.exports = async (req, res) => {
   try {
-    // Vercel auto-parses JSON when header = application/json
     const { term = '' } = req.body || {};
     const q = term.toString().trim();
-
-    console.log('[handler] incoming term:', q || '(empty)');
+    console.log('──────────────────────────────────────────────');
+    console.log('[handler] incoming term:', `"${q}"`);
 
     if (!q) {
       console.warn('[handler] term missing');
@@ -55,20 +50,28 @@ module.exports = async (req, res) => {
 
     await load();
 
-    // 1) Exact code match
+    // 1) exact product_code match
     const exact = cache.filter(
-      (r) => r.product_code && r.product_code.toLowerCase() === q.toLowerCase()
+      r => r.product_code && r.product_code.toLowerCase() === q.toLowerCase()
     );
 
-    // 2) Fuzzy fallback
-    const hits =
-      exact.length > 0
-        ? exact
-        : fuse.search(q).map((r) => r.item).slice(0, 10);
+    // 2) fuzzy fallback (full result list with scores for debug)
+    const fuzzyRaw = fuse.search(q);
+    console.log('[handler] fuse raw size:', fuzzyRaw.length,
+      'top-5:', fuzzyRaw.slice(0, 5).map(r => ({
+        score: r.score.toFixed(3),
+        name: r.item.product_name
+      }))
+    );
+
+    const hits = exact.length
+      ? exact
+      : fuzzyRaw.map(r => r.item).slice(0, 10);
 
     console.log(
-      `[handler] exact matches: ${exact.length}, fuzzy matches returned: ${hits.length}`
+      `[handler] exact matches: ${exact.length}, final hits returned: ${hits.length}`
     );
+    if (hits.length === 0) console.log('[handler] NO RESULTS');
 
     return res.json(hits);
   } catch (err) {
