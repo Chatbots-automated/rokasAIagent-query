@@ -1,41 +1,3 @@
-[req] raw body: {"term":"BDM_12345"}
-[handler] incoming term: "BDM_12345" len: 9
-[load] refreshing cache from Supabase …
-[load] cache rebuilt – rows: 1000 mem ~ 0.5 MB
-[exact] count: 0 sample: []
-[fuse] total: 92 top-5: [
-  {
-    score: '0.111',
-    code: 'BDM_1034575',
-    name: 'STAT MIXER MBX6.5-20-S 10:1 SP (Pakuotė)'
-  },
-  {
-    score: '0.111',
-    code: 'BDM_234503',
-    name: 'LOCTITE 573 TTL 50 ml EGFD'
-  },
-  {
-    score: '0.111',
-    code: 'BDM_234534',
-    name: 'LOCTITE 574 ACC50ML EGFD'
-  },
-  {
-    score: '0.111',
-    code: 'BDM_234534',
-    name: 'LOCTITE 574 ACC50ML EGFD'
-  },
-  {
-    score: '0.222',
-    code: 'BDM_1034026',
-    name: '50 ML-S 10:1 CART DISP S-50 AU'
-  }
-]
-[hits] returned: 10 sample: [ 'BDM_1034575', 'BDM_234503', 'BDM_234534' ]
-[done] elapsed ms: 1076.3
-
-
-code:
-
 const { createClient } = require('@supabase/supabase-js');
 const Fuse = require('fuse.js');
 const { performance } = require('perf_hooks');
@@ -51,7 +13,7 @@ const supabase = createClient(
 let cache = null;
 let fuse  = null;
 let last  = 0;
-const TTL = 5 * 60 * 1000; // 5 min
+const TTL = 5 * 60 * 1000;  // 5 min
 
 async function load() {
   if (cache && Date.now() - last < TTL) {
@@ -71,46 +33,39 @@ async function load() {
   });
   last = Date.now();
   console.log('[load] cache rebuilt – rows:', cache.length,
-              'mem ~', (JSON.stringify(cache).length / 1024 / 1024).toFixed(1), 'MB');
+              'mem ~', (JSON.stringify(cache).length / 1024 / 1024).toFixed(1), ' MB');
 }
 
 // ─── Handler ────────────────────────────────────────────────────────────
 module.exports = async (req, res) => {
   const t0 = performance.now();
   try {
-    console.log('──────────────────────────────────────────────');
-    console.log('[req] raw body:', JSON.stringify(req.body));
-
     const { term = '' } = req.body || {};
     const q = term.toString().trim();
-    console.log('[handler] incoming term:', "${q}", 'len:', q.length);
+    console.log(`[handler] incoming term: "${q}" len: ${q.length}`);
 
     if (!q) return res.status(400).json({ error: 'term missing' });
 
     await load();
 
-    // exact match
+    // 1) exact code match
     const exact = cache.filter(r =>
       r.product_code && r.product_code.toLowerCase() === q.toLowerCase()
     );
-    console.log('[exact] count:', exact.length,
-      'sample:', exact.slice(0, 3).map(r => r.product_code));
 
-    // fuzzy
+    // If query matches BDM_ code pattern, return only exact
+    if (/^BDM_\d+$/i.test(q)) {
+      console.log('[mode] strict code search. exact hits:', exact.length);
+      return res.json(exact);          // may be empty array if not found
+    }
+
+    // 2) fuzzy search for names, barcodes, etc.
     const fuzzyRaw = fuse.search(q);
-    console.log('[fuse] total:', fuzzyRaw.length,
-      'top-5:', fuzzyRaw.slice(0, 5).map(r => ({
-        score: r.score.toFixed(3),
-        code:  r.item.product_code,
-        name:  r.item.product_name.slice(0, 40)
-      }))
-    );
+    const hits = exact.length ? exact
+               : fuzzyRaw.map(r => r.item).slice(0, 10);
 
-    const hits = exact.length ? exact : fuzzyRaw.map(r => r.item).slice(0, 10);
-    console.log('[hits] returned:', hits.length,
-      'sample:', hits.slice(0, 3).map(r => r.product_code));
-
-    console.log('[done] elapsed ms:', (performance.now() - t0).toFixed(1));
+    console.log('[mode] fuzzy search. hits returned:', hits.length);
+    console.log('[handler] elapsed ms:', (performance.now() - t0).toFixed(1));
     return res.json(hits);
   } catch (err) {
     console.error('[fatal]', err);
