@@ -1,0 +1,9 @@
+{
+  "name": "bm-inventory-api",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.8",
+    "fuse.js": "^6.6.2"
+  }
+}
