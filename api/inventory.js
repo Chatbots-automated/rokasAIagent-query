@@ -9,26 +9,89 @@ const supabase = createClient(
   { auth: { persistSession: false } }
 );
 
-// ─── In-memory cache & indices ─────────────────────────────────────────
-let cache = null;
-let fuse  = null;
-let idx   = null; // normalized indices
-let last  = 0;
-const TTL = 5 * 60 * 1000; // 5 min
+// ─── Helpers to read both ASCII & diacritics headers ────────────────────
+const V = {
+  code:                ['product_code','Prekes Nr.','Prekės Nr.'],
+  name:                ['product_name','Prekes pavadinimas','Prekės pavadinimas'],
+  barcode:             ['barcode','Bruksninis kodas','Brūkšninis kodas'],
+  supplier:            ['supplier','Tiekejas','Tiekėjas'],
+  expiry:              ['expiry_date','Galiojimo data'],
+  lot:                 ['lot','LOT'],
+  warehouse:           ['warehouse','Sandelis','Sandėlis'],
+  package_number:      ['package_number','Paketo numeris'],
+  location:            ['location','Vieta'],
+  pallet_number:       ['pallet_number','Padeklo Nr.','Padėklo Nr.'],
+  status:              ['status','Busena','Būsena'],
+  location_type:       ['location_type','Vietos tipas'],
+  unit:                ['unit','Vienetas'],
+  stock_total:         ['stock_total','Faktines atsargos','Faktinės atsargos'],
+  reserved:            ['reserved','Faktiskai rezervuota','Faktiškai rezervuota'],
+  available:           ['available','Faktiskai turima','Faktiškai turima'],
+};
 
-function normCode(v) {
-  return (v ?? '').toString().trim().toUpperCase();
+const normCode = (v) => (v ?? '').toString().trim().toUpperCase();
+const normText = (v) => (v ?? '').toString().trim().toLowerCase();
+const tokens   = (v) => (v ?? '').toString().toLowerCase().split(/[,\s]+/).filter(Boolean);
+
+function getField(row, variants) {
+  for (const k of variants) if (row[k] !== undefined) return row[k];
+  return null;
 }
-function normName(v) {
-  return (v ?? '').toString().trim().toLowerCase();
+function canonize(row) {
+  const code   = getField(row, V.code);
+  const name   = getField(row, V.name);
+  const bc     = getField(row, V.barcode);
+  const lot    = getField(row, V.lot);
+  const wh     = getField(row, V.warehouse);
+  const loc    = getField(row, V.location);
+  const pkg    = getField(row, V.package_number);
+  const pal    = getField(row, V.pallet_number);
+  const stat   = getField(row, V.status);
+  const ltype  = getField(row, V.location_type);
+  const supp   = getField(row, V.supplier);
+  const unit   = getField(row, V.unit) || 'vnt';
+  const avail  = Number(getField(row, V.available)) || 0;
+  const expRaw = getField(row, V.expiry);
+
+  // parse expiry (supports ISO or "YYYY.MM.DD")
+  let expiry = null;
+  if (expRaw) {
+    const s = String(expRaw);
+    if (/^\d{4}\.\d{2}\.\d{2}$/.test(s)) {
+      const [y,m,d] = s.split('.');
+      expiry = `${y}-${m}-${d}`;
+    } else {
+      const d = new Date(s);
+      if (!isNaN(d)) expiry = d.toISOString().slice(0,10);
+    }
+  }
+
+  return {
+    code,
+    name,
+    barcode: bc,
+    barcodeTokens: tokens(bc),
+    lot,
+    warehouse: wh,
+    location: loc,
+    package_number: pkg,
+    pallet_number: pal,
+    status: stat,
+    location_type: ltype,
+    supplier: supp,
+    unit,
+    available: avail,
+    expiry_date: expiry,
+  };
 }
-function barcodeTokens(v) {
-  return (v ?? '')
-    .toString()
-    .toLowerCase()
-    .split(/[,\s]+/)
-    .filter(Boolean);
-}
+
+// ─── In-memory cache & indices ─────────────────────────────────────────
+let cache = null;     // original rows
+let view  = null;     // canonical view per row
+let fuse  = null;
+let idx   = null;     // indices
+let last  = 0;
+const TTL = 5 * 60 * 1000;
 
 async function load() {
   if (cache && Date.now() - last < TTL) {
@@ -40,39 +103,68 @@ async function load() {
   if (error) throw new Error('Supabase: ' + error.message);
 
   cache = Array.isArray(data) ? data : [];
+  view  = cache.map(canonize);
 
-  // Build indices
-  const byCode = new Map();   // NORM_CODE -> Set(real product_code variants)
-  const byName = new Map();   // NORM_NAME -> Set(real product_code)
-  const byBc   = new Map();   // barcode token -> Set(real product_code)
+  // Build indices over many columns
+  const byCode = new Map();   // NORM_CODE -> Set(real code)
+  const byName = new Map();   // norm name -> Set(code)
+  const byLot  = new Map();   // lot token -> Set(code)
+  const byWh   = new Map();   // warehouse token -> Set(code)
+  const byLoc  = new Map();   // location token -> Set(code)
+  const byPkg  = new Map();   // package token -> Set(code)
+  const byPal  = new Map();   // pallet token -> Set(code)
+  const byStat = new Map();   // status token -> Set(code)
+  const bySupp = new Map();   // supplier token -> Set(code)
+  const byBc   = new Map();   // barcode token -> Set(code)
 
-  for (const r of cache) {
-    const codeRaw = r.product_code ?? '';
-    const codeN   = normCode(codeRaw);
-    if (codeN) {
-      if (!byCode.has(codeN)) byCode.set(codeN, new Set());
-      byCode.get(codeN).add(r.product_code);
-    }
-
-    const nameN = normName(r.product_name);
-    if (nameN) {
-      if (!byName.has(nameN)) byName.set(nameN, new Set());
-      byName.get(nameN).add(r.product_code);
-    }
-
-    for (const t of barcodeTokens(r.barcode)) {
-      if (!byBc.has(t)) byBc.set(t, new Set());
-      byBc.get(t).add(r.product_code);
-    }
+  function add(map, key, code) {
+    if (!key) return;
+    const k = key.toLowerCase().trim();
+    if (!k) return;
+    if (!map.has(k)) map.set(k, new Set());
+    map.get(k).add(code);
   }
 
-  idx = { byCode, byName, byBc };
+  for (const v of view) {
+    const codeN = normCode(v.code);
+    if (codeN) {
+      if (!byCode.has(codeN)) byCode.set(codeN, new Set());
+      byCode.get(codeN).add(v.code);
+    }
 
-  fuse = new Fuse(cache, {
-    keys: ['product_name', 'product_code', 'barcode'],
+    add(byName, v.name, v.code);
+    add(byLot, v.lot, v.code);
+    add(byWh, v.warehouse, v.code);
+    add(byLoc, v.location, v.code);
+    add(byPkg, v.package_number, v.code);
+    add(byPal, v.pallet_number, v.code);
+    add(byStat, v.status, v.code);
+    add(bySupp, v.supplier, v.code);
+    for (const t of v.barcodeTokens) add(byBc, t, v.code);
+  }
+
+  idx = { byCode, byName, byLot, byWh, byLoc, byPkg, byPal, byStat, bySupp, byBc };
+
+  // Fuse across many fields (joined text)
+  fuse = new Fuse(view.map((v, i) => ({
+    i, // index to get back to view/cache
+    code: v.code, name: v.name, barcode: v.barcode,
+    lot: v.lot, warehouse: v.warehouse, location: v.location,
+    package_number: v.package_number, pallet_number: v.pallet_number,
+    status: v.status, supplier: v.supplier,
+    haystack: [
+      v.code, v.name, v.barcode, v.lot, v.warehouse, v.location,
+      v.package_number, v.pallet_number, v.status, v.supplier, v.location_type
+    ].filter(Boolean).join(' ')
+  })), {
+    keys: [
+      'code','name','barcode','lot','warehouse','location',
+      'package_number','pallet_number','status','supplier','haystack'
+    ],
     threshold: 0.35,
     includeScore: true,
     ignoreLocation: true,
+    minMatchCharLength: 2,
   });
 
   last = Date.now();
@@ -80,7 +172,7 @@ async function load() {
               'mem ~', (JSON.stringify(cache).length / 1024 / 1024).toFixed(1), 'MB');
 }
 
-// Normalize incoming term (strip prompt fluff like "Query this item:")
+// ─── Query handling ────────────────────────────────────────────────────
 function sanitizeTerm(raw) {
   const s = String(raw ?? '').trim();
   if (!s) return '';
@@ -90,116 +182,122 @@ function sanitizeTerm(raw) {
     .trim();
 }
 
-// pick the code with max available sum if multiple
-function pickBestCode(codes) {
-  if (!codes || !codes.size) return null;
-  if (codes.size === 1) return [...codes][0];
+function pickBestCode(codeSet) {
+  if (!codeSet || !codeSet.size) return null;
+  if (codeSet.size === 1) return [...codeSet][0];
+
+  // choose by highest total available across all rows for that code
   const sums = new Map();
-  for (const c of codes) sums.set(c, 0);
-  for (const r of cache) {
-    if (sums.has(r.product_code)) {
-      sums.set(r.product_code, (sums.get(r.product_code) || 0) + (Number(r.available) || 0));
-    }
+  for (const c of codeSet) sums.set(c, 0);
+  for (let n = 0; n < view.length; n++) {
+    const v = view[n];
+    if (sums.has(v.code)) sums.set(v.code, (sums.get(v.code) || 0) + (v.available || 0));
   }
   let best = null, bestSum = -1;
-  for (const [c, s] of sums) {
-    if (s > bestSum) bestSum = s, best = c;
-  }
-  return best || [...codes][0];
+  for (const [c, s] of sums) if (s > bestSum) bestSum = s, best = c;
+  return best || [...codeSet][0];
 }
 
-// Resolve to a single product_code (robust)
 function resolveProductCode(q) {
   if (!q) return null;
+  const qCode = normCode(q);
+  const qText = q.toLowerCase().trim();
 
-  const qCodeN = normCode(q);
-  const qNameN = normName(q);
-  const qBcTok = q.toLowerCase().trim();
-
-  // 0) If looks like a BDM code, try multiple strategies
   const looksLikeCode = /^bdm_\d+$/i.test(q);
 
-  // 1) Exact normalized code match via index
-  if (looksLikeCode && idx.byCode.has(qCodeN)) {
-    const codes = idx.byCode.get(qCodeN);
-    console.log('[resolve] exact code via index:', qCodeN, 'variants:', [...codes]);
+  // 1) Exact code
+  if (looksLikeCode && idx.byCode.has(qCode)) {
+    const codes = idx.byCode.get(qCode);
+    console.log('[resolve] exact code:', qCode, 'variants:', [...codes]);
     return pickBestCode(codes);
   }
 
-  // 2) Strict scan equality with trim (covers trailing spaces in DB)
+  // 2) Scan equal (covers stray spaces/case in DB)
   {
-    const exact = cache.find(r => normCode(r.product_code) === qCodeN);
-    if (exact) {
-      console.log('[resolve] exact code via scan:', exact.product_code);
-      return exact.product_code;
+    const hit = view.find(v => normCode(v.code) === qCode);
+    if (hit) {
+      console.log('[resolve] scan equal code:', hit.code);
+      return hit.code;
     }
   }
 
-  // 3) code startsWith / includes (handles partials or trailing chars)
+  // 3) Code startsWith / includes
   if (looksLikeCode) {
-    const cands = cache.filter(r => normCode(r.product_code).startsWith(qCodeN));
-    if (cands.length) {
-      console.log('[resolve] code startsWith candidates:', cands.length);
-      const codes = new Set(cands.map(r => r.product_code));
-      return pickBestCode(codes);
+    const starts = new Set(view.filter(v => normCode(v.code).startsWith(qCode)).map(v => v.code));
+    if (starts.size) {
+      console.log('[resolve] code startsWith hits:', starts.size);
+      return pickBestCode(starts);
     }
-    const cands2 = cache.filter(r => normCode(r.product_code).includes(qCodeN));
-    if (cands2.length) {
-      console.log('[resolve] code includes candidates:', cands2.length);
-      const codes = new Set(cands2.map(r => r.product_code));
-      return pickBestCode(codes);
+    const incl = new Set(view.filter(v => normCode(v.code).includes(qCode)).map(v => v.code));
+    if (incl.size) {
+      console.log('[resolve] code includes hits:', incl.size);
+      return pickBestCode(incl);
     }
   }
 
-  // 4) Exact name via index
-  if (idx.byName.has(qNameN)) {
-    const codes = idx.byName.get(qNameN);
-    console.log('[resolve] exact name via index:', q);
+  // 4) Exact name
+  if (idx.byName.has(qText)) {
+    const codes = idx.byName.get(qText);
+    console.log('[resolve] exact name hit:', qText, 'codes:', [...codes]);
     return pickBestCode(codes);
   }
 
-  // 5) Name startsWith
-  {
-    const starts = cache.filter(r => normName(r.product_name).startsWith(qNameN));
-    if (starts.length) {
-      console.log('[resolve] name startsWith hits:', starts.length);
-      const codes = new Set(starts.map(r => r.product_code));
+  // 5) Other exact-column hits (lot / package / pallet / location / warehouse / status / supplier / barcode token)
+  const exactMaps = [
+    ['lot',   idx.byLot],
+    ['pkg',   idx.byPkg],
+    ['pal',   idx.byPal],
+    ['loc',   idx.byLoc],
+    ['wh',    idx.byWh],
+    ['stat',  idx.byStat],
+    ['supp',  idx.bySupp],
+    ['bcTok', idx.byBc],
+  ];
+  for (const [label, map] of exactMaps) {
+    if (map.has(qText)) {
+      const codes = map.get(qText);
+      console.log(`[resolve] exact ${label} hit:`, qText, 'codes:', [...codes]);
       return pickBestCode(codes);
     }
   }
 
-  // 6) Barcode token match (exact token)
-  if (idx.byBc.has(qBcTok)) {
-    const codes = idx.byBc.get(qBcTok);
-    console.log('[resolve] barcode token hit:', qBcTok, 'codes:', [...codes]);
-    return pickBestCode(codes);
+  // 6) startsWith on name/location if the phrase looks like text
+  if (!looksLikeCode) {
+    const nameStarts = new Set(view.filter(v => normText(v.name).startsWith(qText)).map(v => v.code));
+    if (nameStarts.size) {
+      console.log('[resolve] name startsWith hits:', nameStarts.size);
+      return pickBestCode(nameStarts);
+    }
+    const locStarts = new Set(view.filter(v => normText(v.location).startsWith(qText)).map(v => v.code));
+    if (locStarts.size) {
+      console.log('[resolve] location startsWith hits:', locStarts.size);
+      return pickBestCode(locStarts);
+    }
   }
 
-  // 7) Fuzzy fallback
+  // 7) Fuzzy across all searchable text
   const fz = fuse.search(q);
   if (fz.length) {
+    const top = fz[0];
     console.log('[resolve] fuzzy top:', {
-      score: fz[0].score?.toFixed(3),
-      code: fz[0].item.product_code,
-      name: fz[0].item.product_name,
+      score: top.score?.toFixed(3),
+      code: view[top.item.i].code,
+      name: view[top.item.i].name,
     });
-    return fz[0].item.product_code;
-  }
-
-  // 8) Last-ditch: fuzzy on normalized code
-  if (looksLikeCode) {
-    const fzCode = fuse.search(qCodeN);
-    if (fzCode.length) {
-      console.log('[resolve] fuzzy code last-ditch:', fzCode[0].item.product_code);
-      return fzCode[0].item.product_code;
-    }
+    return view[top.item.i].code;
   }
 
   return null;
 }
 
 function rowsForCode(code) {
-  return cache.filter(r => r.product_code === code);
+  // return original rows that match that code (case-insensitively)
+  const cNorm = normCode(code);
+  const rows = [];
+  for (let n = 0; n < view.length; n++) {
+    if (normCode(view[n].code) === cNorm) rows.push(cache[n]);
+  }
+  return rows;
 }
 
 // ─── Handler ───────────────────────────────────────────────────────────
@@ -222,13 +320,12 @@ module.exports = async (req, res) => {
     console.log('[resolve] chosen product_code:', chosenCode || '(none)');
 
     if (!chosenCode) {
-      // Extra debug for code-like queries
       if (/^bdm_\d+$/i.test(q)) {
-        const normMatches = cache
-          .filter(r => normCode(r.product_code).includes(normCode(q)))
+        const near = view
+          .filter(v => normCode(v.code).includes(normCode(q)))
           .slice(0, 5)
-          .map(r => r.product_code);
-        console.log('[debug] norm includes candidates (first 5):', normMatches);
+          .map(v => v.code);
+        console.log('[debug] code includes (first5):', near);
       }
       console.log('[resolve] no match – returning empty array');
       return res.json([]);
