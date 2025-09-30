@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BM-Chemie Assistant</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin:0; }
+    .bmc-chat-btn{position:fixed;bottom:18px;right:18px;width:56px;height:56px;border-radius:50%;
+      background:#0f172a;color:#fff;border:none;box-shadow:0 10px 20px rgba(0,0,0,.18);cursor:pointer;font-size:22px}
+    .bmc-panel{position:fixed;bottom:86px;right:18px;width:360px;max-width:calc(100vw - 36px);height:520px;background:#fff;
+      border-radius:14px;box-shadow:0 18px 40px rgba(0,0,0,.25);display:none;overflow:hidden;border:1px solid rgba(0,0,0,.06)}
+    .bmc-panel.open{display:flex;flex-direction:column}
+    .bmc-head{padding:12px 14px;background:#0f172a;color:#fff;font-weight:600;display:flex;align-items:center;justify-content:space-between}
+    .bmc-body{flex:1;overflow-y:auto;padding:12px;background:#f8fafc}
+    .bmc-msg{margin:8px 0;display:flex}
+    .bmc-msg.user{justify-content:flex-end}
+    .bmc-bubble{max-width:80%;padding:10px 12px;border-radius:12px;line-height:1.35;font-size:14px;white-space:pre-wrap}
+    .bmc-msg.user .bmc-bubble{background:#0f172a;color:#fff;border-bottom-right-radius:4px}
+    .bmc-msg.assistant .bmc-bubble{background:#fff;color:#111827;border-bottom-left-radius:4px;border:1px solid #e5e7eb}
+    .bmc-foot{padding:10px;display:flex;gap:8px;border-top:1px solid #e5e7eb;background:#fff}
+    .bmc-input{flex:1;padding:10px 12px;border-radius:10px;border:1px solid #d1d5db;font-size:14px}
+    .bmc-send{padding:10px 14px;border-radius:10px;border:none;background:#0f172a;color:#fff;cursor:pointer;font-weight:600}
+    .bmc-send[disabled]{opacity:.6;cursor:not-allowed}
+    .bmc-hint{font-size:12px;color:#64748b;padding:0 12px 8px}
+  </style>
+</head>
+<body>
+
+<button class="bmc-chat-btn" aria-label="Open chat">💬</button>
+
+<div class="bmc-panel" id="bmc-panel">
+  <div class="bmc-head">
+    <div>BM-Chemie Assistant</div>
+    <button class="bmc-close" style="background:none;border:none;color:#fff;font-size:18px;cursor:pointer">✕</button>
+  </div>
+  <div class="bmc-body" id="bmc-body"></div>
+  <div class="bmc-hint">Ask about KLC1 stock, expiry, locations…</div>
+  <div class="bmc-foot">
+    <input class="bmc-input" id="bmc-input" type="text" placeholder="Type your message…" />
+    <button class="bmc-send" id="bmc-send">Send</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  // ====== CONFIG ======
+  const N8N_WEBHOOK_URL = "https://n8n-up8s.onrender.com/webhook-test/b4eef0eb-1c29-46e8-9482-40b141f861e0";
+  const STORAGE_KEY = "bmchemie_chat_session_v2";
+  const HISTORY_LIMIT = 30; // last N user+assistant turns kept locally
+  // ====================
+
+  // -- session: persistent chatId + history in localStorage
+  function loadSession(){
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    const chatId = (crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : "cid_" + Math.random().toString(36).slice(2);
+    const session = { chatId, history: [] };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+    return session;
+  }
+  function saveSession(){
+    try {
+      const trim = {
+        chatId: state.session.chatId,
+        history: state.session.history.slice(-HISTORY_LIMIT*2)
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(trim));
+    } catch {}
+  }
+  const state = { session: loadSession(), open:false, sending:false };
+
+  // UI refs
+  const btn = document.querySelector('.bmc-chat-btn');
+  const panel = document.getElementById('bmc-panel');
+  const closeBtn = panel.querySelector('.bmc-close');
+  const body = document.getElementById('bmc-body');
+  const input = document.getElementById('bmc-input');
+  const send = document.getElementById('bmc-send');
+
+  function renderHistory(){
+    body.innerHTML = '';
+    state.session.history.forEach(m => {
+      const row = document.createElement('div');
+      row.className = 'bmc-msg ' + m.role;
+      const bub = document.createElement('div');
+      bub.className = 'bmc-bubble';
+      bub.textContent = m.content;
+      row.appendChild(bub);
+      body.appendChild(row);
+    });
+    body.scrollTop = body.scrollHeight;
+  }
+  renderHistory();
+
+  function toggle(open){
+    state.open = open;
+    panel.classList.toggle('open', open);
+    if (open) setTimeout(()=>input.focus(), 10);
+  }
+  btn.addEventListener('click', ()=> toggle(!state.open));
+  closeBtn.addEventListener('click', ()=> toggle(false));
+
+  async function sendMessage(){
+    const text = input.value.trim();
+    if (!text || state.sending) return;
+    state.sending = true; send.disabled = true; input.value = '';
+
+    // push user msg locally
+    state.session.history.push({ role: 'user', content: text });
+    renderHistory();
+
+    const payload = {
+      chatInput: text,
+      chatId: state.session.chatId,
+      history: state.session.history.slice(-HISTORY_LIMIT*2),
+      metadata: { url: location.href, ua: navigator.userAgent }
+    };
+
+    try {
+      const res = await fetch(N8N_WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Chat-Id': state.session.chatId, // handy in n8n
+        },
+        // CORS preflight is automatic due to JSON; Render allows it by default
+        body: JSON.stringify(payload),
+      });
+
+      // be tolerant: n8n sometimes returns text/plain
+      const ct = res.headers.get('content-type') || '';
+      let data;
+      if (ct.includes('application/json')) {
+        data = await res.json();
+      } else {
+        const txt = await res.text();
+        try { data = JSON.parse(txt); } catch { data = { content: txt || 'OK' }; }
+      }
+
+      const reply = (typeof data === 'string' && data)
+                 || data.content
+                 || data.response
+                 || 'OK';
+      state.session.history.push({ role: 'assistant', content: reply });
+    } catch (err) {
+      state.session.history.push({ role: 'assistant', content: 'Connection error. Please try again.' });
+    } finally {
+      state.sending = false; send.disabled = false;
+      renderHistory(); saveSession(); input.focus();
+    }
+  }
+
+  send.addEventListener('click', sendMessage);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
+
+  // Optional: reset chat via hash
+  if (location.hash === '#reset') {
+    localStorage.removeItem(STORAGE_KEY);
+    state.session = loadSession();
+    renderHistory();
+  }
+})();
+</script>
+</body>
+</html>
