@@ -164,3 +164,171 @@
       <button class="bmc-chip" data-q="Where is BDM_242865 stored?">Where is BDM_242865?</button>
     </div>
     <div class="bmc-row">
+      <input class="bmc-input" id="bmc-input" type="text" placeholder="Type your message…" />
+      <button class="bmc-send" id="bmc-send">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  // ====== CONFIG ======
+  const N8N_WEBHOOK_URL = "https://n8n-up8s.onrender.com/webhook-test/b4eef0eb-1c29-46e8-9482-40b141f861e0";
+  const STORAGE_KEY = "bmchemie_chat_session_v3";
+  const HISTORY_LIMIT = 30;
+  // ====================
+
+  function loadSession(){
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    const chatId = (crypto && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : "cid_" + Math.random().toString(36).slice(2);
+    const session = { chatId, history: [
+      { role:'assistant', content: "Hi! I can check KLC1 stock, expiry, and locations. What product do you have in mind?" }
+    ]};
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+    return session;
+  }
+  function saveSession(){
+    try {
+      const trim = {
+        chatId: state.session.chatId,
+        history: state.session.history.slice(-HISTORY_LIMIT*2)
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(trim));
+    } catch {}
+  }
+  const state = { session: loadSession(), open:false, sending:false };
+
+  // UI refs
+  const btn = document.querySelector('.bmc-chat-btn');
+  const panel = document.getElementById('bmc-panel');
+  const closeBtn = panel.querySelector('.bmc-close');
+  const body = document.getElementById('bmc-body');
+  const input = document.getElementById('bmc-input');
+  const send = document.getElementById('bmc-send');
+  const chips = document.getElementById('bmc-chips');
+
+  // Render
+  function bubble(role, content){
+    const row = document.createElement('div');
+    row.className = 'bmc-msg ' + role;
+
+    if (role === 'assistant'){
+      const avatar = document.createElement('div');
+      avatar.className = 'bmc-avatar';
+      avatar.textContent = 'BM';
+      row.appendChild(avatar);
+    }
+
+    const bub = document.createElement('div');
+    bub.className = 'bmc-bubble';
+    bub.textContent = content;
+    row.appendChild(bub);
+    return row;
+  }
+
+  function typingBubble(){
+    const row = document.createElement('div');
+    row.className = 'bmc-msg assistant';
+    const avatar = document.createElement('div');
+    avatar.className = 'bmc-avatar';
+    avatar.textContent = 'BM';
+    const bub = document.createElement('div');
+    bub.className = 'bmc-bubble';
+    const t = document.createElement('div');
+    t.className = 'typing';
+    t.innerHTML = '<span class="dot"></span><span class="dot"></span><span class="dot"></span>';
+    bub.appendChild(t);
+    row.appendChild(avatar);
+    row.appendChild(bub);
+    return row;
+  }
+
+  function renderHistory(){
+    body.innerHTML = '';
+    state.session.history.forEach(m => body.appendChild(bubble(m.role, m.content)));
+    body.scrollTop = body.scrollHeight;
+  }
+  renderHistory();
+
+  // Panel open/close
+  function toggle(open){
+    state.open = open;
+    panel.classList.toggle('open', open);
+    if (open) setTimeout(()=>input.focus(), 80);
+  }
+  btn.addEventListener('click', ()=> toggle(!state.open));
+  closeBtn.addEventListener('click', ()=> toggle(false));
+
+  // Send flow
+  async function sendMessage(text){
+    const msg = (text ?? input.value).trim();
+    if (!msg || state.sending) return;
+    state.sending = true; send.disabled = true; input.value = '';
+
+    // User bubble
+    state.session.history.push({ role: 'user', content: msg });
+    body.appendChild(bubble('user', msg));
+    body.scrollTop = body.scrollHeight;
+
+    // Typing indicator
+    const typing = typingBubble();
+    body.appendChild(typing);
+    body.scrollTop = body.scrollHeight;
+
+    const payload = {
+      chatInput: msg,
+      chatId: state.session.chatId,
+      history: state.session.history.slice(-HISTORY_LIMIT*2),
+      metadata: { url: location.href, ua: navigator.userAgent }
+    };
+
+    try {
+      const res = await fetch(N8N_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json', 'X-Chat-Id': state.session.chatId },
+        body: JSON.stringify(payload)
+      });
+      const ct = res.headers.get('content-type') || '';
+      let data;
+      if (ct.includes('application/json')) data = await res.json();
+      else { const txt = await res.text(); try { data = JSON.parse(txt); } catch { data = { content: txt || 'OK' }; } }
+      const reply = (typeof data === 'string' && data) || data.content || data.response || 'OK';
+
+      state.session.history.push({ role:'assistant', content: reply });
+      body.replaceChild(bubble('assistant', reply), typing);
+    } catch (err) {
+      const errMsg = 'Connection error. Please try again.';
+      state.session.history.push({ role:'assistant', content: errMsg });
+      body.replaceChild(bubble('assistant', errMsg), typing);
+    } finally {
+      state.sending = false; send.disabled = false;
+      saveSession(); input.focus();
+      body.scrollTop = body.scrollHeight;
+    }
+  }
+
+  send.addEventListener('click', ()=> sendMessage());
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
+  chips.addEventListener('click', e => {
+    const btn = e.target.closest('.bmc-chip');
+    if (!btn) return;
+    sendMessage(btn.dataset.q || btn.textContent);
+  });
+
+  // Reset helper
+  if (location.hash === '#reset') {
+    localStorage.removeItem(STORAGE_KEY);
+    state.session = loadSession();
+    renderHistory();
+  }
+})();
+</script>
+</body>
+</html>
