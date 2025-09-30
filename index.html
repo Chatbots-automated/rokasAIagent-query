@@ -5,168 +5,162 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>BM-Chemie Assistant</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin:0; }
-    .bmc-chat-btn{position:fixed;bottom:18px;right:18px;width:56px;height:56px;border-radius:50%;
-      background:#0f172a;color:#fff;border:none;box-shadow:0 10px 20px rgba(0,0,0,.18);cursor:pointer;font-size:22px}
-    .bmc-panel{position:fixed;bottom:86px;right:18px;width:360px;max-width:calc(100vw - 36px);height:520px;background:#fff;
-      border-radius:14px;box-shadow:0 18px 40px rgba(0,0,0,.25);display:none;overflow:hidden;border:1px solid rgba(0,0,0,.06)}
-    .bmc-panel.open{display:flex;flex-direction:column}
-    .bmc-head{padding:12px 14px;background:#0f172a;color:#fff;font-weight:600;display:flex;align-items:center;justify-content:space-between}
-    .bmc-body{flex:1;overflow-y:auto;padding:12px;background:#f8fafc}
-    .bmc-msg{margin:8px 0;display:flex}
-    .bmc-msg.user{justify-content:flex-end}
-    .bmc-bubble{max-width:80%;padding:10px 12px;border-radius:12px;line-height:1.35;font-size:14px;white-space:pre-wrap}
-    .bmc-msg.user .bmc-bubble{background:#0f172a;color:#fff;border-bottom-right-radius:4px}
-    .bmc-msg.assistant .bmc-bubble{background:#fff;color:#111827;border-bottom-left-radius:4px;border:1px solid #e5e7eb}
-    .bmc-foot{padding:10px;display:flex;gap:8px;border-top:1px solid #e5e7eb;background:#fff}
-    .bmc-input{flex:1;padding:10px 12px;border-radius:10px;border:1px solid #d1d5db;font-size:14px}
-    .bmc-send{padding:10px 14px;border-radius:10px;border:none;background:#0f172a;color:#fff;cursor:pointer;font-weight:600}
+    :root{
+      --brand:#0f172a;           /* deep slate */
+      --brand-2:#1e293b;
+      --accent:#38bdf8;          /* cyan accent */
+      --bg:#ffffff;
+      --bg-soft:#f8fafc;
+      --text:#0f172a;
+      --muted:#64748b;
+      --ring:rgba(56,189,248,.35);
+      --shadow:0 18px 40px rgba(0,0,0,.25);
+      --br:16px;                 /* border radius */
+    }
+    @media (prefers-color-scheme: dark){
+      :root{
+        --bg:#0b1020;
+        --bg-soft:#0d1326;
+        --text:#e5e7eb;
+        --muted:#9aa3b2;
+        --brand:#0b1224;
+        --brand-2:#0f1a33;
+        --shadow:0 18px 40px rgba(0,0,0,.6);
+      }
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:transparent;color:var(--text)}
+
+    /* FAB */
+    .bmc-chat-btn{
+      position:fixed;bottom:18px;right:18px;width:60px;height:60px;border-radius:50%;
+      background:linear-gradient(135deg,var(--brand),var(--brand-2));
+      color:#fff;border:none;box-shadow:0 10px 24px rgba(0,0,0,.22);
+      cursor:pointer;font-size:22px;display:grid;place-items:center;
+      transition:transform .15s ease, box-shadow .2s ease;
+    }
+    .bmc-chat-btn:hover{transform:translateY(-1px);box-shadow:0 14px 28px rgba(0,0,0,.26)}
+    .bmc-chat-btn:active{transform:translateY(0)}
+
+    /* Panel */
+    .bmc-panel{
+      position:fixed;bottom:92px;right:18px;width:380px;max-width:calc(100vw - 36px);height:560px;
+      background:var(--bg);border-radius:var(--br);box-shadow:var(--shadow);display:none;overflow:hidden;
+      border:1px solid rgba(0,0,0,.06);transform-origin:bottom right;opacity:0;transform:scale(.98);
+      transition:opacity .18s ease, transform .18s ease;
+    }
+    .bmc-panel.open{display:flex;flex-direction:column;opacity:1;transform:scale(1)}
+    .bmc-head{
+      padding:12px 14px;background:linear-gradient(135deg,var(--brand),var(--brand-2));color:#fff;
+      display:flex;align-items:center;gap:10px;position:relative;
+    }
+    .bmc-brand{
+      width:32px;height:32px;border-radius:10px;display:grid;place-items:center;
+      background:rgba(255,255,255,.12);font-weight:700
+    }
+    .bmc-title{font-weight:700;letter-spacing:.2px}
+    .bmc-sub{font-size:12px;opacity:.85}
+    .bmc-close{
+      margin-left:auto;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.15);
+      color:#fff;border-radius:9px;padding:6px 8px;font-size:14px;cursor:pointer
+    }
+    .bmc-body{
+      flex:1;overflow-y:auto;padding:14px;background:var(--bg-soft);
+      scrollbar-width:thin;scrollbar-color:rgba(0,0,0,.25) transparent;
+    }
+    .bmc-body::-webkit-scrollbar{width:10px}
+    .bmc-body::-webkit-scrollbar-thumb{background:rgba(0,0,0,.18);border-radius:10px}
+
+    .bmc-hint{font-size:12px;color:var(--muted);padding:6px 14px 10px;background:var(--bg-soft);border-top:1px solid rgba(0,0,0,.06)}
+    .bmc-foot{
+      padding:10px;background:var(--bg);display:flex;flex-direction:column;gap:10px;border-top:1px solid rgba(0,0,0,.06)
+    }
+    .bmc-row{display:flex;gap:8px}
+    .bmc-input{
+      flex:1;padding:12px 14px;border-radius:12px;border:1px solid #d1d5db;background:#fff;color:#0f172a;font-size:14px;outline:none;
+      transition:border-color .15s ease, box-shadow .15s ease;
+    }
+    @media (prefers-color-scheme: dark){
+      .bmc-input{background:#0f152b;border-color:#1f2a44;color:#e5e7eb}
+    }
+    .bmc-input:focus{border-color:var(--accent);box-shadow:0 0 0 4px var(--ring)}
+    .bmc-send{
+      padding:12px 16px;border-radius:12px;border:none;background:linear-gradient(135deg,var(--brand),var(--brand-2));
+      color:#fff;cursor:pointer;font-weight:700;min-width:92px
+    }
     .bmc-send[disabled]{opacity:.6;cursor:not-allowed}
-    .bmc-hint{font-size:12px;color:#64748b;padding:0 12px 8px}
+
+    /* Messages */
+    .bmc-msg{margin:10px 0;display:flex;gap:8px}
+    .bmc-msg.user{justify-content:flex-end}
+    .bmc-bubble{
+      max-width:78%;padding:10px 12px;border-radius:14px;line-height:1.35;font-size:14px;white-space:pre-wrap;
+      box-shadow:0 10px 22px rgba(0,0,0,.08)
+    }
+    .bmc-avatar{
+      width:28px;height:28px;border-radius:50%;display:grid;place-items:center;font-size:13px;flex:0 0 28px;
+      background:#e2e8f0;color:#0f172a;border:1px solid #cbd5e1
+    }
+    @media (prefers-color-scheme: dark){
+      .bmc-avatar{background:#111a34;color:#dbeafe;border-color:#1f2a44}
+    }
+    .bmc-msg.user .bmc-bubble{background:linear-gradient(135deg,var(--brand),var(--brand-2));color:#fff;border-bottom-right-radius:4px}
+    .bmc-msg.assistant .bmc-bubble{background:#fff;color:#111827;border:1px solid #e5e7eb;border-bottom-left-radius:4px}
+    @media (prefers-color-scheme: dark){
+      .bmc-msg.assistant .bmc-bubble{background:#0f152b;border-color:#1e2a44;color:#e5e7eb}
+    }
+
+    /* Quick chips */
+    .bmc-chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 2px}
+    .bmc-chip{
+      font-size:12px;color:var(--text);background:var(--bg-soft);border:1px solid rgba(0,0,0,.08);
+      padding:6px 8px;border-radius:999px;cursor:pointer
+    }
+    .bmc-chip:hover{border-color:var(--accent);box-shadow:0 0 0 3px var(--ring)}
+
+    /* Typing dots */
+    .typing{display:inline-flex;gap:4px;align-items:center}
+    .dot{width:6px;height:6px;border-radius:50%;background:#a8b3c7;opacity:.6;animation:bounce 1.2s infinite}
+    .dot:nth-child(2){animation-delay:.15s}
+    .dot:nth-child(3){animation-delay:.3s}
+    @keyframes bounce{
+      0%,60%,100%{transform:translateY(0);opacity:.5}
+      30%{transform:translateY(-4px);opacity:1}
+    }
+
+    /* Small screens */
+    @media (max-width:480px){
+      .bmc-panel{width:100vw;right:0;bottom:0;max-width:100vw;height:100dvh;border-radius:0}
+      .bmc-chat-btn{right:12px;bottom:12px}
+    }
   </style>
 </head>
 <body>
 
-<button class="bmc-chat-btn" aria-label="Open chat">💬</button>
+<button class="bmc-chat-btn" aria-label="Open chat" title="Chat with BM-Chemie">💬</button>
 
-<div class="bmc-panel" id="bmc-panel">
+<div class="bmc-panel" id="bmc-panel" aria-live="polite">
   <div class="bmc-head">
-    <div>BM-Chemie Assistant</div>
-    <button class="bmc-close" style="background:none;border:none;color:#fff;font-size:18px;cursor:pointer">✕</button>
+    <div class="bmc-brand">BM</div>
+    <div>
+      <div class="bmc-title">BM-Chemie Assistant</div>
+      <div class="bmc-sub">Stock · Expiry · Locations (KLC1)</div>
+    </div>
+    <button class="bmc-close">Close ✕</button>
   </div>
+
   <div class="bmc-body" id="bmc-body"></div>
-  <div class="bmc-hint">Ask about KLC1 stock, expiry, locations…</div>
-  <div class="bmc-foot">
-    <input class="bmc-input" id="bmc-input" type="text" placeholder="Type your message…" />
-    <button class="bmc-send" id="bmc-send">Send</button>
+
+  <div class="bmc-hint">
+    Tip: try <em>“Teroson 3900 KL”</em> or a code like <em>BDM_175470</em>. Only KLC1 stock is shown.
   </div>
-</div>
 
-<script>
-(function(){
-  // ====== CONFIG ======
-  const N8N_WEBHOOK_URL = "https://n8n-up8s.onrender.com/webhook-test/b4eef0eb-1c29-46e8-9482-40b141f861e0";
-  const STORAGE_KEY = "bmchemie_chat_session_v2";
-  const HISTORY_LIMIT = 30; // last N user+assistant turns kept locally
-  // ====================
-
-  // -- session: persistent chatId + history in localStorage
-  function loadSession(){
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) return JSON.parse(raw);
-    } catch {}
-    const chatId = (crypto && crypto.randomUUID)
-      ? crypto.randomUUID()
-      : "cid_" + Math.random().toString(36).slice(2);
-    const session = { chatId, history: [] };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
-    return session;
-  }
-  function saveSession(){
-    try {
-      const trim = {
-        chatId: state.session.chatId,
-        history: state.session.history.slice(-HISTORY_LIMIT*2)
-      };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(trim));
-    } catch {}
-  }
-  const state = { session: loadSession(), open:false, sending:false };
-
-  // UI refs
-  const btn = document.querySelector('.bmc-chat-btn');
-  const panel = document.getElementById('bmc-panel');
-  const closeBtn = panel.querySelector('.bmc-close');
-  const body = document.getElementById('bmc-body');
-  const input = document.getElementById('bmc-input');
-  const send = document.getElementById('bmc-send');
-
-  function renderHistory(){
-    body.innerHTML = '';
-    state.session.history.forEach(m => {
-      const row = document.createElement('div');
-      row.className = 'bmc-msg ' + m.role;
-      const bub = document.createElement('div');
-      bub.className = 'bmc-bubble';
-      bub.textContent = m.content;
-      row.appendChild(bub);
-      body.appendChild(row);
-    });
-    body.scrollTop = body.scrollHeight;
-  }
-  renderHistory();
-
-  function toggle(open){
-    state.open = open;
-    panel.classList.toggle('open', open);
-    if (open) setTimeout(()=>input.focus(), 10);
-  }
-  btn.addEventListener('click', ()=> toggle(!state.open));
-  closeBtn.addEventListener('click', ()=> toggle(false));
-
-  async function sendMessage(){
-    const text = input.value.trim();
-    if (!text || state.sending) return;
-    state.sending = true; send.disabled = true; input.value = '';
-
-    // push user msg locally
-    state.session.history.push({ role: 'user', content: text });
-    renderHistory();
-
-    const payload = {
-      chatInput: text,
-      chatId: state.session.chatId,
-      history: state.session.history.slice(-HISTORY_LIMIT*2),
-      metadata: { url: location.href, ua: navigator.userAgent }
-    };
-
-    try {
-      const res = await fetch(N8N_WEBHOOK_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Chat-Id': state.session.chatId, // handy in n8n
-        },
-        // CORS preflight is automatic due to JSON; Render allows it by default
-        body: JSON.stringify(payload),
-      });
-
-      // be tolerant: n8n sometimes returns text/plain
-      const ct = res.headers.get('content-type') || '';
-      let data;
-      if (ct.includes('application/json')) {
-        data = await res.json();
-      } else {
-        const txt = await res.text();
-        try { data = JSON.parse(txt); } catch { data = { content: txt || 'OK' }; }
-      }
-
-      const reply = (typeof data === 'string' && data)
-                 || data.content
-                 || data.response
-                 || 'OK';
-      state.session.history.push({ role: 'assistant', content: reply });
-    } catch (err) {
-      state.session.history.push({ role: 'assistant', content: 'Connection error. Please try again.' });
-    } finally {
-      state.sending = false; send.disabled = false;
-      renderHistory(); saveSession(); input.focus();
-    }
-  }
-
-  send.addEventListener('click', sendMessage);
-  input.addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-  });
-
-  // Optional: reset chat via hash
-  if (location.hash === '#reset') {
-    localStorage.removeItem(STORAGE_KEY);
-    state.session = loadSession();
-    renderHistory();
-  }
-})();
-</script>
-</body>
-</html>
+  <div class="bmc-foot">
+    <div class="bmc-chips" id="bmc-chips">
+      <button class="bmc-chip" data-q="Show items under 10 units">Under 10 units</button>
+      <button class="bmc-chip" data-q="Expiry for LOCTITE 272">Expiry for Loctite 272</button>
+      <button class="bmc-chip" data-q="Find TEROSON MS 9320">Teroson MS 9320</button>
+      <button class="bmc-chip" data-q="Where is BDM_242865 stored?">Where is BDM_242865?</button>
+    </div>
+    <div class="bmc-row">
