@@ -2,169 +2,89 @@ const { createClient } = require('@supabase/supabase-js');
 const Fuse = require('fuse.js');
 const { performance } = require('perf_hooks');
 
-// ─── Supabase ───────────────────────────────────────────────────────────
+// ─── Supabase (jūsų naujas projektas) ───────────────────────────────────
 const supabase = createClient(
   'https://xvjruntzmvkjzhdpmoca.supabase.co',
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh2anJ1bnR6bXZranpoZHBtb2NhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NTI3MDkwNSwiZXhwIjoyMDcwODQ2OTA1fQ.Q1NFONsR2ct5BZV8uS994iItD_Wlq1SGZwH3R4xCPA0',
   { auth: { persistSession: false } }
 );
 
-// ─── Helpers to read both ASCII & diacritics headers ────────────────────
-const V = {
-  code:                ['product_code','Prekes Nr.','Prekės Nr.'],
-  name:                ['product_name','Prekes pavadinimas','Prekės pavadinimas'],
-  barcode:             ['barcode','Bruksninis kodas','Brūkšninis kodas'],
-  supplier:            ['supplier','Tiekejas','Tiekėjas'],
-  expiry:              ['expiry_date','Galiojimo data'],
-  lot:                 ['lot','LOT'],
-  warehouse:           ['warehouse','Sandelis','Sandėlis'],
-  package_number:      ['package_number','Paketo numeris'],
-  location:            ['location','Vieta'],
-  pallet_number:       ['pallet_number','Padeklo Nr.','Padėklo Nr.'],
-  status:              ['status','Busena','Būsena'],
-  location_type:       ['location_type','Vietos tipas'],
-  unit:                ['unit','Vienetas'],
-  stock_total:         ['stock_total','Faktines atsargos','Faktinės atsargos'],
-  reserved:            ['reserved','Faktiskai rezervuota','Faktiškai rezervuota'],
-  available:           ['available','Faktiskai turima','Faktiškai turima'],
-};
-
-const normCode = (v) => (v ?? '').toString().trim().toUpperCase();
-const normText = (v) => (v ?? '').toString().trim().toLowerCase();
-const tokens   = (v) => (v ?? '').toString().toLowerCase().split(/[,\s]+/).filter(Boolean);
-
-function getField(row, variants) {
-  for (const k of variants) if (row[k] !== undefined) return row[k];
-  return null;
-}
-function canonize(row) {
-  const code   = getField(row, V.code);
-  const name   = getField(row, V.name);
-  const bc     = getField(row, V.barcode);
-  const lot    = getField(row, V.lot);
-  const wh     = getField(row, V.warehouse);
-  const loc    = getField(row, V.location);
-  const pkg    = getField(row, V.package_number);
-  const pal    = getField(row, V.pallet_number);
-  const stat   = getField(row, V.status);
-  const ltype  = getField(row, V.location_type);
-  const supp   = getField(row, V.supplier);
-  const unit   = getField(row, V.unit) || 'vnt';
-  const avail  = Number(getField(row, V.available)) || 0;
-  const expRaw = getField(row, V.expiry);
-
-  // parse expiry (supports ISO or "YYYY.MM.DD")
-  let expiry = null;
-  if (expRaw) {
-    const s = String(expRaw);
-    if (/^\d{4}\.\d{2}\.\d{2}$/.test(s)) {
-      const [y,m,d] = s.split('.');
-      expiry = `${y}-${m}-${d}`;
-    } else {
-      const d = new Date(s);
-      if (!isNaN(d)) expiry = d.toISOString().slice(0,10);
-    }
-  }
-
-  return {
-    code,
-    name,
-    barcode: bc,
-    barcodeTokens: tokens(bc),
-    lot,
-    warehouse: wh,
-    location: loc,
-    package_number: pkg,
-    pallet_number: pal,
-    status: stat,
-    location_type: ltype,
-    supplier: supp,
-    unit,
-    available: avail,
-    expiry_date: expiry,
-  };
-}
-
-// ─── In-memory cache & indices ─────────────────────────────────────────
-let cache = null;     // original rows
-let view  = null;     // canonical view per row
+// ─── Cache & paieškos ───────────────────────────────────────────────────
+let cache = null;
 let fuse  = null;
-let idx   = null;     // indices
 let last  = 0;
 const TTL = 5 * 60 * 1000;
 
-async function load() {
-  if (cache && Date.now() - last < TTL) {
-    console.log('[load] using cached data – rows:', cache.length, 'age(ms):', Date.now() - last);
-    return;
+function norm(s) {
+  return (s ?? '').toString().normalize('NFKC').replace(/\s+/g,' ').trim();
+}
+function onlyKLC1(row) {
+  const w = (row['Sandelis'] || row.warehouse || '').toString().toUpperCase();
+  return w === 'KLC1';
+}
+function notBrokas(row) {
+  const w = (row['Sandelis'] || row.warehouse || '').toString().toUpperCase();
+  return w !== 'BROKAS';
+}
+function asNumber(v) {
+  if (v === '' || v == null) return 0;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+function unitOf(row) {
+  return (row['Vienetas'] || row.unit || '').toString() || 'vnt';
+}
+function skuOf(row) {
+  return row.product_code || row['Prekes Nr.'] || row['Prekės Nr.'] || '';
+}
+function idhOf(row) {
+  return row.external_code || row['Isorinis prekes numeris'] || row['Išorinis prekės numeris'] || null;
+}
+function nameOf(row) {
+  return row.product_name || row['Prekes pavadinimas'] || row['Prekės pavadinimas'] || '';
+}
+function expiryOf(row) {
+  // prefer normalized ISO (YYYY-MM-DD) if present
+  const iso = row.expiry_date || row['Galiojimo data'];
+  if (!iso) return null;
+  // handle already ISO or parsable date
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0,10);
+}
+// extract package size like "50 ml", "250 ml", "300ML", "25KG", etc.
+function packageSizeFromName(name, fallbackUnit) {
+  const s = name.toUpperCase();
+  const m = s.match(/(\d+(?:[.,]\d+)?)\s*(ML|L|KG|G)\b/);
+  if (m) {
+    const qty = m[1].replace(',', '.');
+    const u = m[2].toLowerCase();
+    return `${qty} ${u}`;
   }
+  // fallback: if unit is piece (vnt), try to spot ml/kg tokens without space
+  const m2 = s.match(/(\d+)(ML|KG|G|L)\b/);
+  if (m2) return `${m2[1]} ${m2[2].toLowerCase()}`;
+  // otherwise return unit only to keep grouping stable
+  return fallbackUnit || '';
+}
+
+async function load() {
+  if (cache && Date.now() - last < TTL) return;
   console.log('[load] refreshing cache from Supabase …');
   const { data, error } = await supabase.from('products').select('*');
   if (error) throw new Error('Supabase: ' + error.message);
-
   cache = Array.isArray(data) ? data : [];
-  view  = cache.map(canonize);
 
-  // Build indices over many columns
-  const byCode = new Map();   // NORM_CODE -> Set(real code)
-  const byName = new Map();   // norm name -> Set(code)
-  const byLot  = new Map();   // lot token -> Set(code)
-  const byWh   = new Map();   // warehouse token -> Set(code)
-  const byLoc  = new Map();   // location token -> Set(code)
-  const byPkg  = new Map();   // package token -> Set(code)
-  const byPal  = new Map();   // pallet token -> Set(code)
-  const byStat = new Map();   // status token -> Set(code)
-  const bySupp = new Map();   // supplier token -> Set(code)
-  const byBc   = new Map();   // barcode token -> Set(code)
-
-  function add(map, key, code) {
-    if (!key) return;
-    const k = key.toLowerCase().trim();
-    if (!k) return;
-    if (!map.has(k)) map.set(k, new Set());
-    map.get(k).add(code);
-  }
-
-  for (const v of view) {
-    const codeN = normCode(v.code);
-    if (codeN) {
-      if (!byCode.has(codeN)) byCode.set(codeN, new Set());
-      byCode.get(codeN).add(v.code);
-    }
-
-    add(byName, v.name, v.code);
-    add(byLot, v.lot, v.code);
-    add(byWh, v.warehouse, v.code);
-    add(byLoc, v.location, v.code);
-    add(byPkg, v.package_number, v.code);
-    add(byPal, v.pallet_number, v.code);
-    add(byStat, v.status, v.code);
-    add(bySupp, v.supplier, v.code);
-    for (const t of v.barcodeTokens) add(byBc, t, v.code);
-  }
-
-  idx = { byCode, byName, byLot, byWh, byLoc, byPkg, byPal, byStat, bySupp, byBc };
-
-  // Fuse across many fields (joined text)
-  fuse = new Fuse(view.map((v, i) => ({
-    i, // index to get back to view/cache
-    code: v.code, name: v.name, barcode: v.barcode,
-    lot: v.lot, warehouse: v.warehouse, location: v.location,
-    package_number: v.package_number, pallet_number: v.pallet_number,
-    status: v.status, supplier: v.supplier,
-    haystack: [
-      v.code, v.name, v.barcode, v.lot, v.warehouse, v.location,
-      v.package_number, v.pallet_number, v.status, v.supplier, v.location_type
-    ].filter(Boolean).join(' ')
-  })), {
+  fuse = new Fuse(cache, {
     keys: [
-      'code','name','barcode','lot','warehouse','location',
-      'package_number','pallet_number','status','supplier','haystack'
+      'product_name', 'product_code', 'barcode',
+      'Prekes pavadinimas', 'Prekės pavadinimas',
+      'Prekes Nr.', 'Prekės Nr.',
+      'Isorinis prekes numeris', 'Išorinis prekės numeris'
     ],
-    threshold: 0.35,
+    threshold: 0.3,
     includeScore: true,
     ignoreLocation: true,
-    minMatchCharLength: 2,
   });
 
   last = Date.now();
@@ -172,132 +92,114 @@ async function load() {
               'mem ~', (JSON.stringify(cache).length / 1024 / 1024).toFixed(1), 'MB');
 }
 
-// ─── Query handling ────────────────────────────────────────────────────
-function sanitizeTerm(raw) {
-  const s = String(raw ?? '').trim();
-  if (!s) return '';
-  return s
-    .replace(/^(query|find|search)\s+(this\s+)?(item|product)\s*:?\s*/i, '')
-    .replace(/^"(.*)"$/, '$1')
-    .trim();
+// –– Pagal užklausą: ar tai kodas, ar pavadinimas?
+function looksLikeBDM(q) { return /^BDM_\d+$/i.test(q); }
+
+// –– Pakuočių suvestinė (pirma užklausa)
+function summarizePackages(rows) {
+  // Tik KLC1, be BROKAS
+  const filtered = rows.filter(r => onlyKLC1(r) && notBrokas(r));
+
+  // Grupė: (sku, idh, package_size, unit, name)
+  const groups = new Map();
+  for (const r of filtered) {
+    const sku = skuOf(r);
+    const idh = idhOf(r);
+    const name = nameOf(r);
+    const unit = unitOf(r);
+    const pkg  = packageSizeFromName(name, unit);
+
+    const key = JSON.stringify([sku, idh, pkg, unit, name]);
+    const g = groups.get(key) || { sku, idh, package: pkg, unit, name, total_available:0, total_reserved:0, total_stock:0 };
+    const stock_total = asNumber(r.stock_total || r['Faktines atsargos'] || r['Faktinės atsargos']);
+    const reserved    = asNumber(r.reserved || r['Faktiskai rezervuota'] || r['Faktiškai rezervuota']);
+    const available   = asNumber(r.available || r['Faktiskai turima'] || r['Faktiškai turima']);
+
+    g.total_available += available;
+    g.total_reserved  += reserved;
+    g.total_stock     += stock_total;
+    groups.set(key, g);
+  }
+
+  const items = [...groups.values()];
+  // Surikiuojam pagal pakuotę (pagal skaičių, jei yra)
+  items.sort((a,b) => {
+    const ax = parseFloat((a.package||'').split(' ')[0]) || 0;
+    const bx = parseFloat((b.package||'').split(' ')[0]) || 0;
+    return ax - bx;
+  });
+
+  const totals = {
+    total_available: items.reduce((s,x)=>s + x.total_available, 0),
+    total_reserved:  items.reduce((s,x)=>s + x.total_reserved, 0),
+    total_stock:     items.reduce((s,x)=>s + x.total_stock, 0),
+    unit_hint: items[0]?.unit || 'vnt'
+  };
+
+  // Grąžinam paprastą struktūrą UI-ui / agentui
+  return { kind:'packages', items, totals };
 }
 
-function pickBestCode(codeSet) {
-  if (!codeSet || !codeSet.size) return null;
-  if (codeSet.size === 1) return [...codeSet][0];
+// –– Galiojimų (FEFO) sąrašas (antra užklausa)
+function summarizeExpiry(rows) {
+  const filtered = rows.filter(r => onlyKLC1(r) && notBrokas(r));
 
-  // choose by highest total available across all rows for that code
-  const sums = new Map();
-  for (const c of codeSet) sums.set(c, 0);
-  for (let n = 0; n < view.length; n++) {
-    const v = view[n];
-    if (sums.has(v.code)) sums.set(v.code, (sums.get(v.code) || 0) + (v.available || 0));
+  // Grupė: (package, expiry)
+  const groups = new Map();
+  for (const r of filtered) {
+    const name  = nameOf(r);
+    const unit  = unitOf(r);
+    const pkg   = packageSizeFromName(name, unit);
+    const exp   = expiryOf(r); // ISO arba null
+    const key   = JSON.stringify([pkg, exp]);
+    const g = groups.get(key) || { package: pkg, expiry: exp, qty:0, unit };
+    const available = asNumber(r.available || r['Faktiskai turima'] || r['Faktiškai turima']);
+    g.qty += available;
+    groups.set(key, g);
   }
-  let best = null, bestSum = -1;
-  for (const [c, s] of sums) if (s > bestSum) bestSum = s, best = c;
-  return best || [...codeSet][0];
+
+  let items = [...groups.values()];
+  // Rikiavimas: pirma su data, nuo artimiausios; nullai („—“) gale
+  items.sort((a,b) => {
+    if (!a.expiry && !b.expiry) return 0;
+    if (!a.expiry) return 1;
+    if (!b.expiry) return -1;
+    return a.expiry.localeCompare(b.expiry);
+  });
+
+  // Žyma ⚠️ jei praeitis
+  const today = new Date().toISOString().slice(0,10);
+  for (const it of items) {
+    if (!it.expiry) { it.expiry_label = '—'; it.expired = false; continue; }
+    it.expired = it.expiry < today;
+    it.expiry_label = it.expired ? `⚠️ ${it.expiry}` : it.expiry;
+  }
+
+  return { kind:'expiry', items };
 }
 
-function resolveProductCode(q) {
-  if (!q) return null;
-  const qCode = normCode(q);
-  const qText = q.toLowerCase().trim();
+// –– Rinkti eilutes pagal term
+function searchRowsByTerm(q) {
+  const Q = norm(q);
 
-  const looksLikeCode = /^bdm_\d+$/i.test(q);
-
-  // 1) Exact code
-  if (looksLikeCode && idx.byCode.has(qCode)) {
-    const codes = idx.byCode.get(qCode);
-    console.log('[resolve] exact code:', qCode, 'variants:', [...codes]);
-    return pickBestCode(codes);
+  // 1) Jei BDM kodas – grąžinam visus to kodo įrašus
+  if (looksLikeBDM(Q)) {
+    const rows = cache.filter(r => norm(skuOf(r)).toUpperCase() === Q.toUpperCase());
+    return rows;
   }
 
-  // 2) Scan equal (covers stray spaces/case in DB)
-  {
-    const hit = view.find(v => normCode(v.code) === qCode);
-    if (hit) {
-      console.log('[resolve] scan equal code:', hit.code);
-      return hit.code;
-    }
-  }
+  // 2) Kitaip – fuzzy paieška pagal pavadinimą/kodus/idh
+  const hits = fuse.search(Q);
+  if (!hits.length) return [];
 
-  // 3) Code startsWith / includes
-  if (looksLikeCode) {
-    const starts = new Set(view.filter(v => normCode(v.code).startsWith(qCode)).map(v => v.code));
-    if (starts.size) {
-      console.log('[resolve] code startsWith hits:', starts.size);
-      return pickBestCode(starts);
-    }
-    const incl = new Set(view.filter(v => normCode(v.code).includes(qCode)).map(v => v.code));
-    if (incl.size) {
-      console.log('[resolve] code includes hits:', incl.size);
-      return pickBestCode(incl);
-    }
-  }
-
-  // 4) Exact name
-  if (idx.byName.has(qText)) {
-    const codes = idx.byName.get(qText);
-    console.log('[resolve] exact name hit:', qText, 'codes:', [...codes]);
-    return pickBestCode(codes);
-  }
-
-  // 5) Other exact-column hits (lot / package / pallet / location / warehouse / status / supplier / barcode token)
-  const exactMaps = [
-    ['lot',   idx.byLot],
-    ['pkg',   idx.byPkg],
-    ['pal',   idx.byPal],
-    ['loc',   idx.byLoc],
-    ['wh',    idx.byWh],
-    ['stat',  idx.byStat],
-    ['supp',  idx.bySupp],
-    ['bcTok', idx.byBc],
-  ];
-  for (const [label, map] of exactMaps) {
-    if (map.has(qText)) {
-      const codes = map.get(qText);
-      console.log(`[resolve] exact ${label} hit:`, qText, 'codes:', [...codes]);
-      return pickBestCode(codes);
-    }
-  }
-
-  // 6) startsWith on name/location if the phrase looks like text
-  if (!looksLikeCode) {
-    const nameStarts = new Set(view.filter(v => normText(v.name).startsWith(qText)).map(v => v.code));
-    if (nameStarts.size) {
-      console.log('[resolve] name startsWith hits:', nameStarts.size);
-      return pickBestCode(nameStarts);
-    }
-    const locStarts = new Set(view.filter(v => normText(v.location).startsWith(qText)).map(v => v.code));
-    if (locStarts.size) {
-      console.log('[resolve] location startsWith hits:', locStarts.size);
-      return pickBestCode(locStarts);
-    }
-  }
-
-  // 7) Fuzzy across all searchable text
-  const fz = fuse.search(q);
-  if (fz.length) {
-    const top = fz[0];
-    console.log('[resolve] fuzzy top:', {
-      score: top.score?.toFixed(3),
-      code: view[top.item.i].code,
-      name: view[top.item.i].name,
-    });
-    return view[top.item.i].code;
-  }
-
-  return null;
-}
-
-function rowsForCode(code) {
-  // return original rows that match that code (case-insensitively)
-  const cNorm = normCode(code);
-  const rows = [];
-  for (let n = 0; n < view.length; n++) {
-    if (normCode(view[n].code) === cNorm) rows.push(cache[n]);
-  }
-  return rows;
+  // Imkim platesnį „šeimos“ rinkinį: visi, kurių name apima bazinį terminą (case-insensitive)
+  const termLower = Q.toLowerCase();
+  const family = cache.filter(r => (nameOf(r) || '').toLowerCase().includes(termLower)
+                                || (skuOf(r) || '').toLowerCase().includes(termLower)
+                                || (idhOf(r) || '').toLowerCase().includes(termLower));
+  // Jei šeima labai maža, bent grąžinam top hits
+  if (family.length >= 1) return family;
+  return hits.slice(0,50).map(h => h.item);
 }
 
 // ─── Handler ───────────────────────────────────────────────────────────
@@ -305,36 +207,27 @@ module.exports = async (req, res) => {
   const t0 = performance.now();
   try {
     const { term = '' } = req.body || {};
-    const raw = term.toString();
-    const q   = sanitizeTerm(raw);
+    const view = (req.query.view || 'packages').toString(); // 'packages' | 'expiry'
+    const q = norm(term);
 
     console.log('──────────────────────────────────────────────');
-    console.log('[handler] raw term:', JSON.stringify(raw));
-    console.log('[handler] sanitized:', JSON.stringify(q), 'len:', q.length);
+    console.log('[handler] term:', JSON.stringify(q), 'view:', view);
 
     if (!q) return res.status(400).json({ error: 'term missing' });
-
     await load();
 
-    const chosenCode = resolveProductCode(q);
-    console.log('[resolve] chosen product_code:', chosenCode || '(none)');
+    const rows = searchRowsByTerm(q);
 
-    if (!chosenCode) {
-      if (/^bdm_\d+$/i.test(q)) {
-        const near = view
-          .filter(v => normCode(v.code).includes(normCode(q)))
-          .slice(0, 5)
-          .map(v => v.code);
-        console.log('[debug] code includes (first5):', near);
-      }
-      console.log('[resolve] no match – returning empty array');
-      return res.json([]);
+    let out;
+    if (view === 'expiry') {
+      out = summarizeExpiry(rows);
+    } else {
+      out = summarizePackages(rows);
     }
 
-    const rows = rowsForCode(chosenCode);
-    console.log('[result] rows for code:', chosenCode, 'count:', rows.length);
-    console.log('[done] elapsed ms:', (performance.now() - t0).toFixed(1));
-    return res.json(rows);
+    console.log('[done] kind:', out.kind, 'rows considered:', rows.length,
+                'elapsed ms:', (performance.now() - t0).toFixed(1));
+    return res.json(out);
   } catch (err) {
     console.error('[fatal]', err);
     return res.status(500).json({ error: err.message });
