@@ -1,7 +1,9 @@
 {
   "name": "bm-inventory-api",
   "version": "1.0.0",
+  "private": true,
   "type": "commonjs",
+  "engines": { "node": ">=18" },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.8",
     "fuse.js": "^6.6.2",
