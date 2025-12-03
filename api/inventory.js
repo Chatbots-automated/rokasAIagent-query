@@ -17,7 +17,7 @@ let last  = 0;
 const TTL = 5 * 60 * 1000;
 
 // ─── Normalizers ────────────────────────────────────────────────────────
-function stripDiacritics(s) { return s.normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); }
+function stripDiacritics(s) { return String(s ?? '').normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); }
 function stripWeirdSpaces(s){ return String(s ?? '').replace(/[\u00A0\u2000-\u200D\u2060\uFEFF]/g, ' '); }
 function fold(s){ return stripDiacritics(stripWeirdSpaces(s)).replace(/\s+/g,' ').trim(); }
 function norm(s){ return fold(s).toLowerCase(); }
@@ -93,32 +93,57 @@ function packageSizeFromName(name, fallbackUnit){
 function looksLikeBDM(q){ return /^BDM_\d+$/i.test(q); }
 function looksLikeISODate(q){ return /^\d{4}-\d{2}-\d{2}$/.test(q); }
 
-// Parse low-stock expressions:
-// supports: lt.10 | <10 | <=10 | ≤10 | "under 10" | "less than 10" | "mažiau nei 10" | "maziau nei 10"
+// Parse low-stock expressions (lt.10 | <10 | <=10 | ≤10 | under/below/less than 10 | mažiau (nei) 10)
 function parseLowStock(qRaw){
   const q = norm(qRaw);
 
-  // lt.N
   let m = q.match(/^lt\.(\d+)$/i);
-  if (m) return { op: '<', eq: false, n: Number(m[1]) };
+  if (m) return { op: '<', eq: false, n: Number(m[1]), scope: parseScope(q) };
 
-  // <N or <=N or ≤N
   m = q.match(/^<\s*(\d+)$/);
-  if (m) return { op: '<', eq: false, n: Number(m[1]) };
+  if (m) return { op: '<', eq: false, n: Number(m[1]), scope: parseScope(q) };
   m = q.match(/^<=\s*(\d+)$/);
-  if (m) return { op: '<', eq: true, n: Number(m[1]) };
+  if (m) return { op: '<', eq: true,  n: Number(m[1]), scope: parseScope(q) };
   m = q.match(/^[≤]\s*(\d+)$/);
-  if (m) return { op: '<', eq: true, n: Number(m[1]) };
+  if (m) return { op: '<', eq: true,  n: Number(m[1]), scope: parseScope(q) };
 
-  // english phrases
   m = q.match(/\b(under|less\s*than|below)\s+(\d+)\b/);
-  if (m) return { op: '<', eq: false, n: Number(m[2]) };
+  if (m) return { op: '<', eq: false, n: Number(m[2]), scope: parseScope(q) };
 
-  // lithuanian phrases
   m = q.match(/\b(mažiau|maziau)\s*(nei)?\s*(\d+)\b/);
-  if (m) return { op: '<', eq: false, n: Number(m[3]) };
+  if (m) return { op: '<', eq: false, n: Number(m[3]), scope: parseScope(q) };
 
   return null;
+}
+
+// Scope: detect "all warehouse" phrasing (LT/EN) to bypass KLC1 filter
+function parseScope(q){
+  const s = norm(q);
+  if (/\b(all|entire|whole)\b.*\b(warehouse|stock)\b/.test(s)) return 'all';
+  if (/\b(visas|visuose|visam|visame)\b.*\b(sandel|sandėli)/.test(s)) return 'all';
+  return 'klc1';
+}
+
+// Strip directive/noise tokens from the raw query (e.g., “BDM_142411 expiry” -> “BDM_142411”)
+const NOISE_TOKENS = [
+  'expiry', 'expiries', 'exp', 'bbf', 'galiojimas', 'galiojimai', 'galioj',
+  'rodyk', 'show', 'taip', 'yes', 'please', 'prasau', 'prašau', 'next', 'more',
+  'daugiau', 'longer', 'paketai', 'packages', 'partijos', 'batches'
+];
+function stripNoise(qRaw){
+  const tokens = fold(qRaw).split(' ');
+  const filtered = tokens.filter(t => !NOISE_TOKENS.includes(norm(t)));
+  return filtered.join(' ').trim();
+}
+
+// Extract a “core” product/code/number-like term from mixed input
+function extractCoreTerm(qRaw){
+  const cleaned = stripNoise(qRaw);
+  // Keep a BDM code if present
+  const m = cleaned.match(/BDM_\d+/i);
+  if (m) return m[0];
+  // Otherwise return the cleaned phrase (may be product name/partial or barcode digits)
+  return cleaned;
 }
 
 // ─── Load & index ───────────────────────────────────────────────────────
@@ -155,9 +180,12 @@ async function load(){
 
 // ─── Search ─────────────────────────────────────────────────────────────
 function searchRowsByTerm(qRaw){
-  const Qraw = String(qRaw || '').trim();
+  const coreRaw = extractCoreTerm(qRaw);
+  const Qraw = String(coreRaw || '').trim();
   const Q    = fold(Qraw);
   const Qn   = norm(Qraw);
+
+  if (!Qraw) return [];
 
   if (looksLikeBDM(Q)) {
     const exact  = cache.filter(r => norm(skuOf(r)) === Qn);
@@ -188,8 +216,9 @@ function searchRowsByTerm(qRaw){
 }
 
 // ─── Views ──────────────────────────────────────────────────────────────
-function summarizePackages(rows, titleOverride){
-  const filtered = rows.filter(r => onlyKLC1(r) && notBrokas(r));
+function summarizePackages(rows, titleOverride, scope){
+  // Scope filter: low-stock “all” = all warehouses (still excluding BROKAS), otherwise KLC1 only
+  const filtered = rows.filter(r => (scope === 'all' ? true : onlyKLC1(r)) && notBrokas(r));
 
   const groups = new Map(); // key: [sku, idh, package, unit, name]
   for (const r of filtered) {
@@ -227,17 +256,19 @@ function summarizePackages(rows, titleOverride){
     unit_hint: items[0]?.unit || 'vnt'
   };
 
+  const scopeLabel = scope === 'all' ? 'visuose sandėliuose' : 'KLC1';
   const header = {
     total_available: totals.total_available,
     unit: totals.unit_hint,
-    name_hint: titleOverride || items[0]?.name || (rows[0] ? nameOf(rows[0]) : '')
+    name_hint: (titleOverride ? `${titleOverride}` : (items[0]?.name || '')) + (titleOverride ? '' : ''),
+    scope: scopeLabel
   };
 
   return { kind:'packages', items, totals, header };
 }
 
-function summarizeExpiry(rows, titleOverride){
-  const filtered = rows.filter(r => onlyKLC1(r) && notBrokas(r));
+function summarizeExpiry(rows, titleOverride, scope){
+  const filtered = rows.filter(r => (scope === 'all' ? true : onlyKLC1(r)) && notBrokas(r));
 
   const groups = new Map(); // key: [package, expiry]
   for (const r of filtered) {
@@ -267,10 +298,12 @@ function summarizeExpiry(rows, titleOverride){
     it.expiry_label = it.expired ? `⚠️ ${it.expiry}` : it.expiry;
   }
 
+  const scopeLabel = scope === 'all' ? 'visuose sandėliuose' : 'KLC1';
   const header = {
     name_hint: titleOverride || (rows[0] ? nameOf(rows[0]) : ''),
     unit: rows[0] ? unitOf(rows[0]) : 'vnt',
-    total_available: rows.reduce((s,r)=> s + asNumber(getField(r, F_FAKTISKA_TURIMA)), 0)
+    total_available: rows.reduce((s,r)=> s + asNumber(getField(r, F_FAKTISKA_TURIMA)), 0),
+    scope: scopeLabel
   };
 
   return { kind:'expiry', items, header };
@@ -294,11 +327,13 @@ module.exports = async (req, res) => {
 
     let rows = [];
     let titleOverride = null;
+    let scope = 'klc1'; // default behavior
 
-    // 1) Low-stock filters over the WHOLE warehouse
+    // 1) Low-stock filters over requested scope (default KLC1; if text suggests 'all', do all)
     const low = parseLowStock(qRaw);
     if (low) {
-      rows = cache; // start from all rows
+      rows = cache; // start from all rows; scope handled in summarize (klc1 vs all)
+      scope = low.scope;
       const cmp = (a) => {
         const v = asNumber(getField(a, F_FAKTISKA_TURIMA));
         if (low.op === '<' && low.eq)  return v <= low.n;
@@ -308,7 +343,7 @@ module.exports = async (req, res) => {
       rows = rows.filter(cmp);
       titleOverride = `Likutis ${low.eq ? '≤' : '<'} ${low.n}`;
     }
-    // 2) Expiry cutoff (expiry <= date) over the WHOLE warehouse
+    // 2) Expiry cutoff (expiry <= date) over default scope
     else if (looksLikeISODate(qRaw)) {
       const cutoff = qRaw;
       rows = cache.filter(r => {
@@ -317,15 +352,15 @@ module.exports = async (req, res) => {
       });
       titleOverride = `Galiojimai iki ${cutoff}`;
     }
-    // 3) Normal product/name/code search
+    // 3) Normal product/name/code search (make robust to “BDM_142411 expiry”, etc.)
     else {
       rows = searchRowsByTerm(qRaw);
     }
 
     // Build view
     const out = (view === 'expiry')
-      ? summarizeExpiry(rows, titleOverride)
-      : summarizePackages(rows, titleOverride);
+      ? summarizeExpiry(rows, titleOverride, scope)
+      : summarizePackages(rows, titleOverride, scope);
 
     // Paging on computed items
     const list = out.items || [];
