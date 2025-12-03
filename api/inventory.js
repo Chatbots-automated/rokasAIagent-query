@@ -11,10 +11,11 @@ const supabase = createClient(
 );
 
 // ─── Caching / Fuse ─────────────────────────────────────────────────────
+// Lower TTL so “near-real-time” numbers don’t lag for long.
 let cache = null;
 let fuse  = null;
 let last  = 0;
-const TTL = 5 * 60 * 1000;
+const TTL = 30 * 1000; // 30s
 
 // ─── Normalizers ────────────────────────────────────────────────────────
 function stripDiacritics(s) { return String(s ?? '').normalize('NFKD').replace(/[\u0300-\u036f]/g, ''); }
@@ -124,7 +125,7 @@ function parseScope(q){
   return 'klc1';
 }
 
-// Strip directive/noise tokens from the raw query (e.g., “BDM_142411 expiry” -> “BDM_142411”)
+// Strip directive/noise tokens (e.g., “BDM_142411 expiry” -> “BDM_142411”)
 const NOISE_TOKENS = [
   'expiry', 'expiries', 'exp', 'bbf', 'galiojimas', 'galiojimai', 'galioj',
   'rodyk', 'show', 'taip', 'yes', 'please', 'prasau', 'prašau', 'next', 'more',
@@ -135,8 +136,6 @@ function stripNoise(qRaw){
   const filtered = tokens.filter(t => !NOISE_TOKENS.includes(norm(t)));
   return filtered.join(' ').trim();
 }
-
-// Extract a “core” product/code/number-like term from mixed input
 function extractCoreTerm(qRaw){
   const cleaned = stripNoise(qRaw);
   const m = cleaned.match(/BDM_\d+/i);
@@ -145,8 +144,8 @@ function extractCoreTerm(qRaw){
 }
 
 // ─── Load & index ───────────────────────────────────────────────────────
-async function load(){
-  if (cache && Date.now() - last < TTL) return;
+async function load(force = false){
+  if (!force && cache && Date.now() - last < TTL) return;
   console.log('[load] refreshing cache from Supabase …');
 
   const { data, error } = await supabase.from('products').select('*');
@@ -265,21 +264,29 @@ function summarizePackages(rows, titleOverride, scope){
 function summarizeExpiry(rows, titleOverride, scope){
   const filtered = rows.filter(r => (scope === 'all' ? true : onlyKLC1(r)) && notBrokas(r));
 
-  const groups = new Map(); // key: [package, expiry]
+  // Group by package + expiry
+  const groups = new Map(); // key: [package, expiry, unit]
   for (const r of filtered) {
     const name  = nameOf(r);
     const unit  = unitOf(r);
     const pkg   = packageSizeFromName(name, unit);
     const exp   = expiryOf(r);
-    const key   = JSON.stringify([pkg, exp]);
-    const g = groups.get(key) || { package: pkg, expiry: exp, qty:0, unit };
-    const available = asNumber(getField(r, F_FAKTISKA_TURIMA));
-    g.qty += available;
+    const key   = JSON.stringify([pkg, exp, unit]);
+
+    const stock_total = asNumber(getField(r, F_FAKTINES_ATSARGOS));
+    const reserved    = asNumber(getField(r, F_FAKTISKA_REZ));
+    const available   = asNumber(getField(r, F_FAKTISKA_TURIMA));
+
+    const g = groups.get(key) || { package: pkg, expiry: exp, unit, qty_available:0, qty_reserved:0, qty_total:0 };
+    g.qty_available += available;
+    g.qty_reserved  += reserved;
+    g.qty_total     += stock_total;
     groups.set(key, g);
   }
 
   let items = [...groups.values()];
   items.sort((a,b) => {
+    // FEFO: missing expiry last
     if (!a.expiry && !b.expiry) return 0;
     if (!a.expiry) return 1;
     if (!b.expiry) return -1;
@@ -297,7 +304,9 @@ function summarizeExpiry(rows, titleOverride, scope){
   const header = {
     name_hint: titleOverride || (rows[0] ? nameOf(rows[0]) : ''),
     unit: rows[0] ? unitOf(rows[0]) : 'vnt',
-    total_available: rows.reduce((s,r)=> s + asNumber(getField(r, F_FAKTISKA_TURIMA)), 0),
+    total_available: filtered.reduce((s,r)=> s + asNumber(getField(r, F_FAKTISKA_TURIMA)), 0),
+    total_reserved:  filtered.reduce((s,r)=> s + asNumber(getField(r, F_FAKTISKA_REZ)), 0),
+    total_stock:     filtered.reduce((s,r)=> s + asNumber(getField(r, F_FAKTINES_ATSARGOS)), 0),
     scope: scopeLabel
   };
 
@@ -313,12 +322,14 @@ module.exports = async (req, res) => {
     const view   = String(req.query.view || 'packages'); // 'packages' | 'expiry'
     const limit  = Math.max(1, Math.min(100, Number(req.query.limit || 50)));
     const cursor = Math.max(0, Number(req.query.cursor || 0));
+    const refresh = String(req.query.refresh || '0') === '1'; // force reload
 
     console.log('──────────────────────────────────────────────');
-    console.log('[handler] term:', JSON.stringify(qRaw), 'view:', view, 'limit:', limit, 'cursor:', cursor);
+    console.log('[handler] term:', JSON.stringify(qRaw), 'view:', view, 'limit:', limit, 'cursor:', cursor, 'refresh:', refresh);
 
     if (!qRaw) return res.status(400).json({ error: 'term missing' });
-    await load();
+
+    await load(refresh);
 
     let rows = [];
     let titleOverride = null;
@@ -373,12 +384,14 @@ module.exports = async (req, res) => {
       raw: {
         total: filtered.length,
         rows: rawSliced,     // paged raw rows
-        all_rows: filtered   // full filtered raw set (you asked for everything)
+        all_rows: filtered   // full filtered raw set
       },
       meta: {
         term: qRaw,
         view,
         scope,
+        refresh,
+        cache_age_ms: Date.now() - last,
         generated_ms: Number((performance.now() - t0).toFixed(1))
       }
     };
