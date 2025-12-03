@@ -139,10 +139,8 @@ function stripNoise(qRaw){
 // Extract a “core” product/code/number-like term from mixed input
 function extractCoreTerm(qRaw){
   const cleaned = stripNoise(qRaw);
-  // Keep a BDM code if present
   const m = cleaned.match(/BDM_\d+/i);
   if (m) return m[0];
-  // Otherwise return the cleaned phrase (may be product name/partial or barcode digits)
   return cleaned;
 }
 
@@ -197,11 +195,9 @@ function searchRowsByTerm(qRaw){
     return [];
   }
 
-  // barcode token exact
   const bcHits = cache.filter(r => barcodeTokens(r).includes(Qn));
   if (bcHits.length) return bcHits;
 
-  // fuzzy family sweep
   const hits = fuse.search(Q);
   if (hits.length) {
     const rows = hits.map(h => h.item._ref);
@@ -217,7 +213,6 @@ function searchRowsByTerm(qRaw){
 
 // ─── Views ──────────────────────────────────────────────────────────────
 function summarizePackages(rows, titleOverride, scope){
-  // Scope filter: low-stock “all” = all warehouses (still excluding BROKAS), otherwise KLC1 only
   const filtered = rows.filter(r => (scope === 'all' ? true : onlyKLC1(r)) && notBrokas(r));
 
   const groups = new Map(); // key: [sku, idh, package, unit, name]
@@ -332,7 +327,7 @@ module.exports = async (req, res) => {
     // 1) Low-stock filters over requested scope (default KLC1; if text suggests 'all', do all)
     const low = parseLowStock(qRaw);
     if (low) {
-      rows = cache; // start from all rows; scope handled in summarize (klc1 vs all)
+      rows = cache; // start from all rows; scope handled later
       scope = low.scope;
       const cmp = (a) => {
         const v = asNumber(getField(a, F_FAKTISKA_TURIMA));
@@ -343,7 +338,7 @@ module.exports = async (req, res) => {
       rows = rows.filter(cmp);
       titleOverride = `Likutis ${low.eq ? '≤' : '<'} ${low.n}`;
     }
-    // 2) Expiry cutoff (expiry <= date) over default scope
+    // 2) Expiry cutoff (expiry <= date)
     else if (looksLikeISODate(qRaw)) {
       const cutoff = qRaw;
       rows = cache.filter(r => {
@@ -352,25 +347,48 @@ module.exports = async (req, res) => {
       });
       titleOverride = `Galiojimai iki ${cutoff}`;
     }
-    // 3) Normal product/name/code search (make robust to “BDM_142411 expiry”, etc.)
+    // 3) Normal product/name/code search (robust to “BDM_142411 expiry”, etc.)
     else {
       rows = searchRowsByTerm(qRaw);
     }
 
-    // Build view
+    // Apply scope + BROKAS filtering on raw rows for return
+    const filtered = rows.filter(r => (scope === 'all' ? true : onlyKLC1(r)) && notBrokas(r));
+
+    // Build view from filtered rows
     const out = (view === 'expiry')
-      ? summarizeExpiry(rows, titleOverride, scope)
-      : summarizePackages(rows, titleOverride, scope);
+      ? summarizeExpiry(filtered, titleOverride, scope)
+      : summarizePackages(filtered, titleOverride, scope);
 
-    // Paging on computed items
-    const list = out.items || [];
-    const sliced = list.slice(cursor, cursor + limit);
-    const nextCursor = cursor + limit < list.length ? cursor + limit : null;
+    // Paging (align raw + items)
+    const itemsList   = out.items || [];
+    const itemsSliced = itemsList.slice(cursor, cursor + limit);
+    const nextCursor  = cursor + limit < itemsList.length ? cursor + limit : null;
+    const rawSliced   = filtered.slice(cursor, cursor + limit);
 
-    const response = { ...out, items: sliced, page: { cursor, limit, nextCursor, total: list.length } };
+    const response = {
+      ...out,
+      items: itemsSliced,
+      page: { cursor, limit, nextCursor, total: itemsList.length },
+      raw: {
+        total: filtered.length,
+        rows: rawSliced,     // paged raw rows
+        all_rows: filtered   // full filtered raw set (you asked for everything)
+      },
+      meta: {
+        term: qRaw,
+        view,
+        scope,
+        generated_ms: Number((performance.now() - t0).toFixed(1))
+      }
+    };
 
-    console.log('[done] kind:', response.kind, 'rows considered:', rows.length,
-                'items returned:', sliced.length, 'elapsed ms:', (performance.now() - t0).toFixed(1));
+    console.log('[done] kind:', response.kind,
+      'rows considered:', rows.length,
+      'filtered:', filtered.length,
+      'items returned:', itemsSliced.length,
+      'elapsed ms:', response.meta.generated_ms);
+
     return res.json(response);
   } catch (err) {
     console.error('[fatal]', err);
